@@ -6,3 +6,4 @@ build/
 *.pyd
 RegionGrowth.c
 outputs/
+datasets/
