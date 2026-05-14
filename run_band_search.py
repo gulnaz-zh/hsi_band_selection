@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +100,14 @@ def main() -> None:
     labels = load_mat_array(args.labels, labels_key).squeeze()
     if labels.shape != cube.shape[:2]:
         raise ValueError(f"Label shape {labels.shape} does not match cube spatial shape {cube.shape[:2]}.")
+    seed_label = int(labels[args.seed_row, args.seed_col])
+    if seed_label != args.class_id:
+        warnings.warn(
+            f"Seed ({args.seed_row}, {args.seed_col}) has label {seed_label}, "
+            f"but --class-id is {args.class_id}. Band scores will compare the grown "
+            "region against a different class mask.",
+            stacklevel=2,
+        )
 
     target = class_mask(labels, args.class_id)
     result = find_informative_bands(

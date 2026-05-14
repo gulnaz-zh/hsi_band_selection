@@ -12,7 +12,7 @@ and scoring the projection against a region of interest when labels are availabl
 <img align="center" src="assets/band_selection.png" alt="Spectral band identification workflow" width="520">
 </p>
 
-For labelled datasets, the paper selects seed spatial coordinates from the region of interest using the ground truth, scans candidate seed bands, and compares each projected 3D RGA region to the seed class mask using NMI and ARI. For unlabelled data, the method scans seed bands from selected spatial points, then supports interactive expert-driven band selection by comparing grown-region size, spatial coherence, and TuiView-based visual inspection of the 3D segmentation outputs.
+For labelled datasets, the paper selects seed spatial coordinates from the region of interest using the ground truth, scans candidate seed bands, and compares each projected 3D RGA region to the seed class mask using NMI and ARI. For unlabelled data, the method scans seed bands from selected spatial points, then supports interactive expert-driven band selection by comparing grown-region size, spatial coherence, and PyVista-based visual inspection of the 3D segmentation outputs.
 
 Cython is used in implementation because 3D region growing repeatedly visits neighbouring voxels
 inside large hyperspectral cubes. Moving that inner loop into compiled code avoids
@@ -33,7 +33,7 @@ seed_value - 0.1 * mean(cube) < neighbour_value < seed_value + 0.1 * mean(cube)
 ```
 
 - Projection of the grown 3D region to a 2D spatial mask by union across bands.
-- Export of grown 3D regions to TuiView-readable GeoTIFF stacks for visual inspection.
+- Rendering of grown 3D regions as PyVista perspective figures for visual inspection.
 - Band scoring with Normalized Mutual Information (NMI) and Adjusted Rand Index (ARI).
 - Informative-band selection with a 0.75 NMI/ARI threshold, relaxed to `0.75 * max_score` when a class never reaches 0.75.
 - Final segmentation aggregation over ten equidistant bands in the selected range:
@@ -55,35 +55,36 @@ threshold and returns a binary 3D segmented region as depicted in the figure bel
 <img src="assets/3DRGA.png" alt="3D region-growing flow" width="520">
 </p>
 
-## Algorithm and TuiView Workflow
+## Algorithm and PyVista Workflow
 
 The code supports two complementary ways to use the proposed algorithm:
 
 1. `run_band_search.py` runs 3D RGA over candidate seed bands, projects each 3D
    region to a 2D mask, and scores each band with NMI/ARI when labels are
    available.
-2. `visualize_tuiview.py` runs the same 3D RGA step but exports the binary 3D
-   segmentation volumes as GeoTIFF raster stacks for inspection in
-   [TuiView](https://tuiview.org/).
+2. `visualize_pyvista.py` runs the same 3D RGA step but renders the binary 3D
+   segmentation volumes as perspective figures with [PyVista](https://pyvista.org/).
 
 This mirrors the publication workflow: the algorithm identifies bands
-quantitatively, while TuiView is used to inspect how the grown 3D regions change
-across spectral seed bands, as in the Salinas example below:
+quantitatively, while PyVista is used to inspect how the grown 3D regions change
+across spectral bands, as in the Salinas example below:
 
 <p align="center" width="100%">
 <img src="assets/example.png" alt="Salinas 3D RGA examples across seed bands" width="680">
 </p>
 
-Each `*_region3d.tif` written by `visualize_tuiview.py` stores one binary 3D RGA
-output as a raster stack where GeoTIFF bands correspond to HSI spectral bands. Each
-`*_projection2d.tif` stores the 2D union projection used for NMI/ARI scoring.
+Each `*_region3d.png` written by `visualize_pyvista.py` shows one binary 3D RGA
+output in perspective. The renderer draws continuous colored mask surfaces over a
+grayscale HSI base plane, so the output resembles the paper figures rather than a
+voxel point cloud. The spatial axes are image row/column coordinates, and the
+vertical axis is the spectral band index.
 
 ## Files
 
 - `src/hsi_region_growing.py`: main implementation.
 - `src/dataset_presets.py`: dataset-specific preprocessing for the paper datasets.
 - `run_band_search.py`: command-line runner for `.mat` HSI datasets.
-- `visualize_tuiview.py`: exports 3D RGA segmentation volumes as GeoTIFFs for TuiView.
+- `visualize_pyvista.py`: renders 3D RGA segmentation volumes with PyVista.
 - `assets/`: figures from the publication and qualitative Salinas examples.
 - `RegionGrowth.pyx`: fast Cython HSI 3D grower.
 - `setup.py`: builds the Cython extension in place.
@@ -97,15 +98,17 @@ python setup.py build_ext --inplace
 
 The expensive 3D region-growing loop runs through Cython when the `RegionGrowth` extension is built. If the extension is missing, the Python API falls back to the pure Python implementation so tests and small examples still run.
 
-To inspect exported 3D regions, install TuiView:
+To render 3D region-growing outputs, install PyVista in an environment that also
+has the project Python dependencies:
 
 ```bash
-conda create -n tuiview-env -c conda-forge tuiview
-conda activate tuiview-env
+conda create -n hsi-viz -c conda-forge python numpy scipy cython setuptools pyvista
+conda activate hsi-viz
+python setup.py build_ext --inplace
 ```
 
-For installation problems or platform-specific dependencies, see the
-[TuiView website](https://tuiview.org/).
+For installation problems or platform-specific rendering dependencies, see the
+[PyVista documentation](https://docs.pyvista.org/).
 
 ## Data
 
@@ -127,30 +130,30 @@ python run_band_search.py \
   --cube datasets/Salinas_corrected.mat \
   --labels datasets/Salinas_gt.mat \
   --class-id 1 \
-  --seed-row 80 --seed-col 60 \
+  --seed-row 225 --seed-col 86 \
   --out outputs/salinas_class_1_scores.csv
 ```
 
 The script prints the selected band indices, contiguous selected ranges, and ARC/MRR
 scores for the widest selected range. It also writes per-band NMI/ARI scores to CSV.
 
-Export 3D region-growing outputs for TuiView using the same style of seed-band
+Render 3D region-growing outputs with PyVista using the same style of seed-band
 sequence shown in the Salinas visualization figure:
 
 ```bash
-python visualize_tuiview.py \
+python visualize_pyvista.py \
   --dataset salinas \
   --cube datasets/Salinas_corrected.mat \
   --seed-row 282 --seed-col 16 \
   --seed-bands 0 25 50 75 100 125 150 175 200 \
-  --out-dir outputs/tuiview_salinas
+  --out-dir outputs/pyvista_salinas
 ```
 
-Add `--open-tuiview` to launch TuiView after the GeoTIFF files are written.
+Add `--show` to open an interactive PyVista window while screenshots are rendered.
 
-Band-score CSV files are written to the path passed with `--out`, and TuiView
-GeoTIFF files are written under the directory passed with `--out-dir`. Output
-folders are created automatically when needed.
+Band-score CSV files are written to the path passed with `--out`, and PyVista PNG
+renders are written under the directory passed with `--out-dir`. Output folders are
+created automatically when needed.
 
 By default, the runner normalizes the cube to `uint8` and uses the Cython grower. If you pass `--no-normalize` with a non-`uint8` cube, the runner uses the slower Python grower unless you convert the cube beforehand.
 
