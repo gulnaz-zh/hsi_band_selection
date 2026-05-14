@@ -1,243 +1,137 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Mon Jun 11 18:50:26 2018
-@author: kaany
----------------------------------------
-Modified on Thursday April 9 08:56 2020
-Support 2D grayscale image
-@author: PengyiZhang 
+"""Fast 3D region growing for hyperspectral image cubes.
+
+This Cython implementation is motivated by the queue-based region-growing
+extension in Pengyi Zhang's RegionGrowth project:
+https://github.com/PengyiZhang/RegionGrowth
+
+The original project supports generic 2D/3D grayscale region growing. This file
+keeps only the HSI-specific 3D routine required by the spectral band
+prioritization workflow in the paper.
 """
 
-from collections import deque
 import numpy as np
-cimport numpy as np
 cimport cython
+cimport numpy as np
+from libc.stdint cimport int64_t
 
-# import logging
-# logging.basicConfig(level=logging.debug)
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cdef class RegionGrow2D:
-    cdef np.uint8_t[:,:] images
-    cdef np.uint8_t[:,:] masks
-    cdef np.uint8_t[:,:] outputMask
+def RegionGrowHSI3D(np.ndarray[np.uint8_t, ndim=3, mode="c"] cube,
+                    int row,
+                    int col,
+                    int band,
+                    double tolerance_fraction=0.1,
+                    double mean_intensity=-1.0):
+    """
+    Fast 6-connected 3D region growing for hyperspectral cubes.
 
-    cdef int sx, sy
-    cdef int upperThreshold
-    cdef int lowerThreshold
-    cdef neighborMode
-    cdef queue
+    Parameters
+    ----------
+    cube:
+        C-contiguous uint8 array with shape (height, width, bands).
+    row, col, band:
+        Seed coordinate in HSI order.
+    tolerance_fraction:
+        Fraction of the global cube mean used around the seed intensity.
+    mean_intensity:
+        Optional precomputed global cube mean. Passing it avoids recomputing the
+        same value during a full spectral-band search.
 
+    Returns
+    -------
+    np.ndarray[np.uint8_t, ndim=3]
+        Binary 3D mask with 1 for grown voxels and 0 for background.
+    """
+    cdef int height = cube.shape[0]
+    cdef int width = cube.shape[1]
+    cdef int bands = cube.shape[2]
+    cdef int y, x, z
+    cdef int64_t total
+    cdef int64_t idx, next_idx
+    cdef int64_t head = 0
+    cdef int64_t tail = 0
+    cdef int64_t i
+    cdef double total_intensity = 0.0
+    cdef double seed_value
+    cdef double lower
+    cdef double upper
+    cdef np.ndarray[np.uint8_t, ndim=3, mode="c"] output
+    cdef np.ndarray[np.int64_t, ndim=1, mode="c"] queue
 
-    def __cinit__(self, np.uint8_t[:,:] images, np.uint8_t[:,:] masks,
-                  int upperThreshold, int lowerThreshold, neighborMode):
-        self.images = images
-        self.masks = masks
-        self.outputMask = np.zeros_like(self.images)
+    if row < 0 or row >= height or col < 0 or col >= width or band < 0 or band >= bands:
+        raise ValueError("Seed is outside cube shape.")
 
-        self.sy = images.shape[0]
-        self.sx = images.shape[1]
+    total = <int64_t>height * <int64_t>width * <int64_t>bands
+    if mean_intensity < 0:
+        for y in range(height):
+            for x in range(width):
+                for z in range(bands):
+                    total_intensity += cube[y, x, z]
+        mean_intensity = total_intensity / total
 
-        self.lowerThreshold = lowerThreshold
-        self.upperThreshold = upperThreshold
-        self.neighborMode = neighborMode
+    seed_value = cube[row, col, band]
+    lower = seed_value - tolerance_fraction * mean_intensity
+    upper = seed_value + tolerance_fraction * mean_intensity
 
-        assert neighborMode in ["4n", "8n"], neighborMode
+    output = np.zeros((height, width, bands), dtype=np.uint8)
+    queue = np.empty(total, dtype=np.int64)
 
-        self.queue = deque()
+    idx = ((<int64_t>row * width) + col) * bands + band
+    queue[tail] = idx
+    tail += 1
+    output[row, col, band] = 1
 
-    def main(self, seeds, update=False):
-        """
-        Basically, seed is a pixel coordinate. However, we support many seeds here
-        """
-        cdef int newItem[2]
-        for seed in seeds:
-            newItem = seed
-            self.outputMask[newItem[0], newItem[1]] = 1
-            self.queue.append((seed[0], seed[1]))
-        
-        if update:
-            self.updateThreshold()
+    while head < tail:
+        idx = queue[head]
+        head += 1
 
-        while len(self.queue) != 0:
-            newItem = self.queue.pop()
-            neighbors = self.getNeighbors(newItem)
-            for neighbor in neighbors:
-                self.checkNeighbour(neighbor[0], neighbor[1])
-        return self.outputMask
+        y = <int>(idx // (<int64_t>width * bands))
+        i = idx - (<int64_t>y * width * bands)
+        x = <int>(i // bands)
+        z = <int>(i - (<int64_t>x * bands))
 
+        if y > 0 and output[y - 1, x, z] == 0:
+            if lower < cube[y - 1, x, z] < upper:
+                output[y - 1, x, z] = 1
+                next_idx = (((<int64_t>y - 1) * width) + x) * bands + z
+                queue[tail] = next_idx
+                tail += 1
 
-    cdef checkNeighbour(self, int y, int x):
-        cdef int intensity
-        if (x < self.sx and y < self.sy
-            and x > -1 and y > -1
-            and self.masks[y,x] == 1):
-            intensity = self.images[y, x]
-            if self.isIntensityAcceptable(intensity) and self.outputMask[y,x] == 0:
-                self.outputMask[y,x] = 1
-                self.queue.append((y, x))
-    
-    cdef isIntensityAcceptable(self, int intensity):
-        if intensity < self.upperThreshold and intensity > self.lowerThreshold:
-            return True
-        return False
+        if y + 1 < height and output[y + 1, x, z] == 0:
+            if lower < cube[y + 1, x, z] < upper:
+                output[y + 1, x, z] = 1
+                next_idx = (((<int64_t>y + 1) * width) + x) * bands + z
+                queue[tail] = next_idx
+                tail += 1
 
-    cdef updateThreshold(self, int lower_margin=3):
-        """
-        Update the lower and upper threshold dynamically 
-        based on the statistics of known foreground pixel values
-        """        
- 
-        cdef int mean, std 
-        cdef np.ndarray[long long, ndim=1] sy, sx
-        cdef np.ndarray[np.uint8_t, ndim=2] outputMask
-        outputMask = np.asarray(self.outputMask)
+        if x > 0 and output[y, x - 1, z] == 0:
+            if lower < cube[y, x - 1, z] < upper:
+                output[y, x - 1, z] = 1
+                next_idx = ((<int64_t>y * width) + x - 1) * bands + z
+                queue[tail] = next_idx
+                tail += 1
 
-        sy, sx = np.where(outputMask>0)
-        cdef np.ndarray[np.uint8_t, ndim=1] intensities 
+        if x + 1 < width and output[y, x + 1, z] == 0:
+            if lower < cube[y, x + 1, z] < upper:
+                output[y, x + 1, z] = 1
+                next_idx = ((<int64_t>y * width) + x + 1) * bands + z
+                queue[tail] = next_idx
+                tail += 1
 
-        intensities = np.asarray(self.images)[sy, sx]
+        if z > 0 and output[y, x, z - 1] == 0:
+            if lower < cube[y, x, z - 1] < upper:
+                output[y, x, z - 1] = 1
+                next_idx = ((<int64_t>y * width) + x) * bands + z - 1
+                queue[tail] = next_idx
+                tail += 1
 
-        mean, std = np.mean(intensities), max(np.std(intensities), lower_margin)
+        if z + 1 < bands and output[y, x, z + 1] == 0:
+            if lower < cube[y, x, z + 1] < upper:
+                output[y, x, z + 1] = 1
+                next_idx = ((<int64_t>y * width) + x) * bands + z + 1
+                queue[tail] = next_idx
+                tail += 1
 
-        self.lowerThreshold = max((mean-3*std),0)
-        self.upperThreshold = min((mean+3*std), 255)
-
-    cdef int[:,:] getNeighbors(self, int[:] newItem):
-        if self.neighborMode == "8n":
-            neighbors = [
-                [newItem[0]-1, newItem[1]],
-                [newItem[0]+1, newItem[1]],
-                [newItem[0], newItem[1]-1],
-                [newItem[0], newItem[1]+1],
-                [newItem[0]-1, newItem[1]-1],
-                [newItem[0]+1, newItem[1]-1],
-                [newItem[0]-1, newItem[1]+1],
-                [newItem[0]+1, newItem[1]+1],                
-            ] 
-                                
-        elif self.neighborMode == "4n":
-            neighbors = [
-                [newItem[0]-1, newItem[1]],
-                [newItem[0]+1, newItem[1]],
-                [newItem[0], newItem[1]-1],
-                [newItem[0], newItem[1]+1],
-            ]
-
-        return np.array(neighbors)
-
-@cython.boundscheck(False)
-@cython.wraparound(False)
-cdef class RegionGrow3D:
-    cdef np.uint8_t[:,:,:] images
-    cdef np.uint8_t[:,:,:] masks
-    cdef np.uint8_t[:,:,:] outputMask
-
-    cdef int sx, sy, sz
-    cdef int upperThreshold
-    cdef int lowerThreshold
-    cdef neighborMode
-    cdef queue
-    
-    def __cinit__(self, np.uint8_t[:,:,:] images, np.uint8_t[:,:,:] masks, 
-                  int upperThreshold, int lowerThreshold, neighborMode):
-        self.images = images
-        self.masks = masks
-        self.outputMask = np.zeros_like(self.images)
-        self.sz = images.shape[0]
-        self.sy = images.shape[1]
-        self.sx = images.shape[2]
-
-        self.upperThreshold = upperThreshold
-        self.lowerThreshold = lowerThreshold
-        self.neighborMode = neighborMode
-        self.queue = deque()
-    
-    def main(self, int seeds, update=False):
-        """
-        seed: list of (z,y,x)
-        """
-        cdef int newItem[3]
-        for seed in seeds:
-            newItem = seed
-            self.outputMask[newItem[0], newItem[1], newItem[2]] = 1
-            self.queue.append((seed[0], seed[1], seed[2]))
-        
-        if update:
-            self.updateThreshold()
-
-        while len(self.queue) != 0:
-            newItem = self.queue.pop()
-            neighbors = self.getNeighbors(newItem)
-            for neighbor in neighbors:
-                self.checkNeighbour(neighbor[0], neighbor[1], neighbor[2])
-        return self.outputMask
-
-    cdef int[:,:,:] getNeighbors(self, int[:] newItem):
-        if self.neighborMode == "26n":
-            neighbors = [
-                [newItem[0]-1, newItem[1]-1, newItem[2]-1],   [newItem[0]-1, newItem[1]-1, newItem[2]],   [newItem[0]-1, newItem[1]-1, newItem[2]+1],
-                [newItem[0]-1, newItem[1], newItem[2]-1],     [newItem[0]-1, newItem[1], newItem[2]],     [newItem[0]-1, newItem[1], newItem[2]+1],
-                [newItem[0]-1, newItem[1]+1, newItem[2]-1],   [newItem[0]-1, newItem[1]+1, newItem[2]],   [newItem[0]-1, newItem[1]+1, newItem[2]+1],
-                [newItem[0], newItem[1]-1, newItem[2]-1],     [newItem[0], newItem[1]-1, newItem[2]],     [newItem[0], newItem[1]-1, newItem[2]+1],
-                [newItem[0], newItem[1], newItem[2]-1],       [newItem[0], newItem[1], newItem[2]+1],     [newItem[0], newItem[1]+1, newItem[2]-1],
-                [newItem[0], newItem[1]+1, newItem[2]],       [newItem[0], newItem[1]+1, newItem[2]+1],   [newItem[0]+1, newItem[1]-1, newItem[2]-1],
-                [newItem[0]+1, newItem[1]-1, newItem[2]],     [newItem[0]+1, newItem[1]-1, newItem[2]+1], [newItem[0]+1, newItem[1], newItem[2]-1],
-                [newItem[0]+1, newItem[1], newItem[2]],       [newItem[0]+1, newItem[1], newItem[2]+1],   [newItem[0]+1, newItem[1]+1, newItem[2]-1],
-                [newItem[0]+1, newItem[1]+1, newItem[2]],     [newItem[0]+1, newItem[1]+1, newItem[2]+1]
-            ] 
-                                
-        elif self.neighborMode == "6n":
-            neighbors = [
-                [newItem[0]-1, newItem[1], newItem[2]],
-                [newItem[0]+1, newItem[1], newItem[2]],
-                [newItem[0], newItem[1]-1, newItem[2]],
-                [newItem[0], newItem[1]+1, newItem[2]],
-                [newItem[0], newItem[1], newItem[2]-1],
-                [newItem[0], newItem[1], newItem[2]+1],
-            ]
-        # 
-        return np.array(neighbors)
-
-
-
-    cdef checkNeighbour(self, int z, int y, int x):
-        cdef int intensity
-        if (x < self.sx and y < self.sy and z < self.sz 
-            and x > -1 and y > -1 and z > -1 
-            and self.masks[z,y,x] == 1):
-            intensity = self.images[z, y, x]
-            if self.isIntensityAcceptable(intensity) and self.outputMask[z,y,x] == 0:
-                self.outputMask[z,y,x] = 1
-                self.queue.append((z, y, x))
-    
-    cdef isIntensityAcceptable(self, int intensity):
-        if intensity < self.upperThreshold and intensity > self.lowerThreshold:
-            return True
-        return False
-
-    cdef updateThreshold(self, int lower_margin=3):
-        """
-        Update the lower and upper threshold dynamically 
-        based on the statistics of known foreground pixel values
-        """        
- 
-        cdef int mean, std 
-        cdef np.ndarray[long long, ndim=1] sz, sy, sx
-        cdef np.ndarray[np.uint8_t, ndim=3] outputMask
-
-        outputMask = np.asarray(self.outputMask)
-        sz, sy, sx = np.where(outputMask>0)
-
-        cdef np.ndarray[np.uint8_t, ndim=1] intensities 
-
-        intensities = np.asarray(self.images)[sz, sy, sx]
-
-        mean, std = np.mean(intensities), max(np.std(intensities), lower_margin)
-
-        self.lowerThreshold = max((mean-3*std),0)
-        self.upperThreshold = min((mean+3*std), 255)
-
-
-
+    return output
